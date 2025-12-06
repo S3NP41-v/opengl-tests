@@ -1,0 +1,324 @@
+{-# LANGUAGE CPP #-}
+{-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE RecordWildCards, OverloadedRecordDot #-}
+{-# LANGUAGE ScopedTypeVariables #-}
+module Main where
+
+
+import Foreign.C.Types
+import Foreign
+import Foreign.Marshal.Array
+
+import Control.Monad
+import System.Exit        ( exitFailure )
+import System.IO
+import SDL.Vect
+import SDL                ( ($=) )
+import Codec.Picture      ( readImage, generateImage, convertRGB8, DynamicImage(..), Image(..), PixelRGB8(..), imageWidth, imageHeight, imageData )
+import Control.Exception  ( handle, SomeException(..), displayException )
+import System.CPUTime     ( getCPUTime )
+import Data.List          ( lookup )
+import Data.Maybe         ( fromJust )
+import Data.Functor       ( (<&>) )
+
+import qualified SDL
+import qualified Data.ByteString as BS
+import qualified Graphics.Rendering.OpenGL as GL
+import qualified Data.Vector.Storable as V
+
+
+
+main :: IO ()
+main = do
+  SDL.initialize [SDL.InitVideo]
+  SDL.HintRenderScaleQuality $= SDL.ScaleLinear
+  
+  do renderQuality <- SDL.get SDL.HintRenderScaleQuality
+     when (renderQuality /= SDL.ScaleLinear) $
+        putStrLn "Linear Texture filtering shit the bed"
+
+  window <- SDL.createWindow "SDL2 + OpenGL" ( SDL.defaultWindow { SDL.windowInitialSize = uncurry V2 res, SDL.windowGraphicsContext = SDL.OpenGLContext SDL.defaultOpenGL } )
+  SDL.showWindow window
+  
+  _ <- SDL.glCreateContext window
+  resources <- initResources
+
+  loop resources window
+  
+  SDL.destroyWindow window
+  SDL.quit
+
+
+loop :: Resources -> SDL.Window -> IO ()
+loop resources window = do
+  events <- SDL.pollEvents
+  ticks <- SDL.ticks
+        
+  let quit = elem SDL.QuitEvent $ map SDL.eventPayload events
+
+  d0 <- getCPUTime
+  draw resources
+  d1 <- getCPUTime
+
+  SDL.glSwapWindow window
+
+  unless quit (loop (resources { delta = fromIntegral (d1-d0) / 1e12
+                               , totalTime = fromIntegral ticks / 1000}
+                               ) window)
+
+
+initResources :: IO Resources
+initResources = do
+  -- compile shaders
+  vs <- compileShader (ShaderSourceFP GL.VertexShader "./shaders/shader.vert") >>= ensure ("Shader Compilation error:\n" <>)
+  fs <- compileShader (ShaderSourceFP GL.FragmentShader "./shaders/shader.frag") >>= ensure ("Shader Compilation error:\n" <>)
+  program <- GL.createProgram
+
+  GL.linkProgram program
+  linkOK <- GL.get $ GL.linkStatus program
+  GL.validateProgram program
+  status <- GL.get $ GL.validateStatus program
+
+  unless (linkOK && status) $ do
+    hPutStrLn stderr "Linking the program shit the bed"
+    plog <- GL.get $ GL.programInfoLog program
+    putStrLn plog
+    exitFailure
+
+  -- vertex array
+  vao <- GL.genObjectName
+  GL.bindVertexArrayObject $= Just vao
+
+  -- element buffer
+  ebo <- GL.genObjectName
+  GL.bindBuffer GL.ElementArrayBuffer $= Just ebo
+  V.unsafeWith indices $ \ptr -> do
+    GL.bufferData GL.ElementArrayBuffer $= (fromIntegral $ V.length indices * sizeOf (V.head indices), ptr, GL.StaticDraw)
+  
+  -- vertex buffers  
+  vbo <- GL.genObjectName
+  GL.bindBuffer GL.ArrayBuffer $= Just vbo
+  V.unsafeWith vertices $ \ptr -> do
+    GL.bufferData GL.ArrayBuffer $= (fromIntegral $ V.length vertices * sizeOf (V.head vertices), ptr, GL.StaticDraw)
+  
+  let vPos = GL.AttribLocation 0
+  GL.vertexAttribPointer vPos $= (GL.ToFloat, GL.VertexArrayDescriptor 3 GL.Float (fromIntegral $ 8 * floatSize) nullPtr)
+  GL.vertexAttribArray vPos $= GL.Enabled
+  
+  let vCol = GL.AttribLocation 1
+  GL.vertexAttribPointer vCol $= (GL.ToFloat, GL.VertexArrayDescriptor 3 GL.Float (fromIntegral $ 8 * floatSize) (plusPtr nullPtr (3 * fromIntegral floatSize)))
+  GL.vertexAttribArray vCol $= GL.Enabled
+
+  let vUV = GL.AttribLocation 2
+  GL.vertexAttribPointer vUV $= (GL.ToFloat, GL.VertexArrayDescriptor 2 GL.Float (fromIntegral $ 8 * floatSize) (plusPtr nullPtr (6 * fromIntegral floatSize)))
+  GL.vertexAttribArray vUV $= GL.Enabled
+  
+
+  -- texture
+  tex <- loadTexture (TextureSourceDI $ missingTexture 512 512) >>= ensure id
+  texLoc <- GL.get $ GL.uniformLocation program "missing"
+  GL.uniform texLoc $= GL.TextureUnit 0
+
+  -- attaching shaders
+  GL.attachShader program vs
+  GL.attachShader program fs
+  
+  -- uniforms
+  ttLoc <- GL.get (GL.uniformLocation program "totalTime")
+  dLoc  <- GL.get (GL.uniformLocation program "delta")
+  rLoc  <- GL.get (GL.uniformLocation program "resolution")
+
+    
+  let totalTime   = 0
+      delta       = 0
+      resolution  = res
+      uniformLocations  = [ ("totalTime", ttLoc) 
+                          , ("delta", dLoc)
+                          , ("resolution", rLoc)
+                          , ("missing", texLoc)
+                          ]
+      textures          = [ ("missing", tex)
+                          ]
+
+
+
+
+  pure $ Resources {..}
+  where
+    floatSize = (fromIntegral $ sizeOf (0 :: GL.GLfloat)) :: GL.GLsizei
+
+-- TODO: use element buffer
+draw :: Resources -> IO ()
+draw resources = do
+  GL.clearColor $= GL.Color4 0.1 0.1 0.14 1
+  GL.clear [GL.ColorBuffer]
+  GL.viewport $= (GL.Position 0 0, uncurry GL.Size (both fromIntegral resources.resolution))
+  
+  let ttLoc = fromJust $ lookup "totalTime"   resources.uniformLocations
+      dLoc  = fromJust $ lookup "delta"       resources.uniformLocations
+      rLoc  = fromJust $ lookup "resolution"  resources.uniformLocations
+      texLoc = fromJust $ lookup "missing"    resources.uniformLocations
+      tex   = fromJust $ lookup "missing"     resources.textures
+
+  -- passing uniforms
+  GL.uniform ttLoc $= resources.totalTime
+  GL.uniform dLoc  $= resources.delta
+  GL.uniform rLoc  $= (uncurry GL.Vector2 (both fromIntegral resources.resolution) :: GL.Vector2 Float)
+
+  
+  -- using shaders , using vertex array object
+  GL.currentProgram $= Just resources.program
+
+  GL.bindVertexArrayObject $= Just resources.vao
+  GL.bindBuffer GL.ElementArrayBuffer $= Just resources.ebo
+  
+  -- wiremode 
+  -- GL.polygonMode $= (GL.Line, GL.Line)
+  
+  -- using texture
+  GL.activeTexture $= GL.TextureUnit 0
+  GL.textureBinding GL.Texture2D $= Just tex
+  GL.uniform texLoc $= (0 :: GL.GLint)
+
+  GL.drawElements GL.Triangles (fromIntegral $ V.length indices) GL.UnsignedInt nullPtr
+
+
+
+loadTexture :: TextureSource -> IO (Either String GL.TextureObject)
+loadTexture = \case
+  TextureSourceFP fp -> do
+    loadImage fp >>= \case
+      Left e    -> pure $ Left e  
+      Right img -> fromDynamicImage img <&> Right
+  
+  TextureSourceDI img -> fromDynamicImage img <&> Right
+
+  _ -> undefined
+
+
+fromDynamicImage :: DynamicImage -> IO GL.TextureObject
+fromDynamicImage img = do
+  let rgb8    = convertRGB8 img
+      iWidth  = fromIntegral $ imageWidth  rgb8
+      iHeight = fromIntegral $ imageHeight rgb8
+      iData   = imageData rgb8
+        
+  texb <- GL.genObjectName
+  GL.textureBinding GL.Texture2D $= Just texb
+
+  GL.textureWrapMode GL.Texture2D GL.S $= (GL.Repeated, GL.ClampToEdge)
+  GL.textureWrapMode GL.Texture2D GL.T $= (GL.Repeated, GL.ClampToEdge)
+  GL.textureFilter   GL.Texture2D      $= ((GL.Linear', Nothing), GL.Linear')
+       
+  V.unsafeWith iData $ \ptr -> do
+    GL.texImage2D GL.Texture2D GL.NoProxy 0 GL.RGB8 (GL.TextureSize2D iWidth iHeight) 0 (GL.PixelData GL.RGB GL.UnsignedByte (castPtr ptr))
+    GL.generateMipmap' GL.Texture2D
+
+        
+  pure texb
+
+
+
+loadImage :: FilePath -> IO (Either String DynamicImage)
+loadImage path = handle (\(SomeException e) -> pure $ Left $ "Load Image could not read file at " <> path <> " because " <> displayException e) $ do
+    readImage path >>= \case
+      Left e -> do
+        putStrLn $ "WARNING: Load Image could not parse file at " <> path <> " becase " <> e <> "\nReplacing with missing texture"
+        pure $ Right $ missingTexture 512 512
+
+      Right img -> pure $ Right img
+
+
+compileShader :: ShaderSource -> IO (Either String GL.Shader)
+compileShader = \case
+  ShaderSourceBS t bs -> compileShader' t bs
+  ShaderSourceFP t path -> handle (\(SomeException e) -> pure (Left $ "Shader compile could not read file at " <> path <> " because " <> displayException e)) $ do
+    bs <- BS.readFile path
+    compileShader' t bs
+
+  where
+    compileShader' :: GL.ShaderType -> BS.ByteString -> IO (Either String GL.Shader)
+    compileShader' st bs = do
+      sd <- GL.createShader st
+      GL.shaderSourceBS sd $= bs
+      GL.compileShader sd
+      sdOK <- GL.get $ GL.compileStatus sd
+
+      if sdOK then do
+        pure (Right sd)
+      
+      else do
+        err <- GL.get $ GL.shaderInfoLog sd       
+        
+        pure (Left err)
+
+
+ensure :: (String -> String) -> Either String a -> IO a
+ensure f (Left err) = putStrLn (f err) >> exitFailure
+ensure _ (Right v)  = pure v
+
+both :: (a -> b) -> (a, a) -> (b, b)
+both f (a, b) = (f a, f b)
+
+missingTexture :: Int -> Int -> DynamicImage
+missingTexture sx sy
+  | sx < 2 || sy < 2  = error "missingTexture is undefined for sizes smaller than 2x2"
+  | otherwise         = ImageRGB8 $ generateImage (\x y -> if odd ((x `div` rx) `mod` rx) /= odd ((y `div` ry) `mod` ry) then PixelRGB8 251 60 249 else PixelRGB8 0 0 0) sx sy
+  where
+    d  = if sx < 10 || sy < 10 then 2 else 10
+    rx = floor (fromIntegral sx / d :: Float) :: Int
+    ry = floor (fromIntegral sy / d :: Float) :: Int
+
+
+
+vertices :: V.Vector GL.GLfloat
+vertices = V.fromList 
+-- |   Positions   | |    Color     | |    UV   |
+  [  0.5,  0.5, 0.0,   1.0, 0.0, 0.0,   1.0, 1.0
+  ,  0.5, -0.5, 0.0,   0.0, 1.0, 0.0,   1.0, 0.0
+  , -0.5, -0.5, 0.0,   0.0, 0.0, 1.0,   0.0, 0.0
+  , -0.5,  0.5, 0.0,   1.0, 1.0, 0.0,   0.0, 1.0
+  ]
+
+indices :: V.Vector GL.GLuint
+indices = V.fromList 
+  [ 0, 1, 3
+  , 1, 2, 3
+  ]
+
+
+triangle :: (Float, Float) -> Float -> [Float]
+triangle (x, y) s = [ x,    y+s,  0 -- x, y, z
+                    , x-s,  y-s,  0
+                    , x+s,  y-s,  0
+                    ]
+
+data TextureSource
+  = TextureSourceBS BS.ByteString
+  | TextureSourceFP FilePath
+  | TextureSourceDI DynamicImage
+
+data ShaderSource
+  = ShaderSourceBS GL.ShaderType BS.ByteString
+  | ShaderSourceFP   GL.ShaderType FilePath
+  deriving ( Show )
+
+data Resources = Resources 
+  { program           :: GL.Program
+  , uniformLocations  :: [(String, GL.UniformLocation)]
+  , textures          :: [(String, GL.TextureObject)]
+  , vao               :: GL.VertexArrayObject
+  , ebo               :: GL.BufferObject
+
+  , resolution        :: (Int, Int)
+  , totalTime         :: Float
+  , delta             :: Float
+  }
+  deriving ( Show )
+
+
+
+res :: Num a => (a, a)
+res = (1280, 720)
+
