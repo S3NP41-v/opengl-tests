@@ -1,0 +1,15 @@
+packages: .
+
+
+profiling: True
+profiling-detail: late
+debug-info: True
+
+
+executable-stripping: true
+library-stripping: true
+
+jobs: $ncpus
+semaphore: true
+optimization: 2
+

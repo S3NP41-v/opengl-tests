@@ -25,9 +25,14 @@ executable opengl-tests
         base  >=4.19
       , OpenGL
       , bytestring
+      , text
       , vector
       , sdl2
       , JuicyPixels
+      , linear
+      , linear-opengl
+      , filepath
+      , directory
 
     hs-source-dirs:   app
     default-language: GHC2021
