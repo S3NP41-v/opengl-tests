@@ -40,6 +40,7 @@ import qualified Data.Vector.Storable as V
 import qualified Data.Text as T
 import qualified Data.Text.IO as TIO
 
+
 main :: IO ()
 main = do
   SDL.initialize [SDL.InitVideo]
